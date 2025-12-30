@@ -606,8 +606,8 @@ client.on('guildMemberAdd', async (member) => {
     const avatarURL = member.user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
     const avatar = await loadImage(avatarURL);
 
-    const cx = 250; // center X
-    const cy = 110;  // center Y
+    const cx = 247; // center X
+    const cy = 107;  // center Y
     const r = 58;   // radius
 
     ctx.save();
