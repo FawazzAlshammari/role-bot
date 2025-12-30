@@ -1,7 +1,7 @@
 require('dotenv').config();
-const fs = require('fs');
+const { createCanvas, loadImage } = require('canvas');
 const path = require('path');
-
+const fs = require('fs');
 const {
   Client,
   GatewayIntentBits,
@@ -9,16 +9,30 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  PermissionsBitField
+  PermissionsBitField,
+  AttachmentBuilder
 } = require('discord.js');
 
 const COMMAND_NAME = 'رولي';
 
+// يسمح لك تستخدم متغير واحد أو أكثر
+// CONTROL_CHANNEL_ID=123
+// أو CONTROL_CHANNEL_IDS=123,456
 const CONTROL_CHANNEL_ID = process.env.CONTROL_CHANNEL_ID || null;
+const CONTROL_CHANNEL_IDS = (process.env.CONTROL_CHANNEL_IDS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-const PANEL_TTL_MS  = parseInt(process.env.PANEL_TTL_MS  || '60000', 10);
-const PROMPT_TTL_MS = parseInt(process.env.PROMPT_TTL_MS || '7000', 10);
-const RESULT_TTL_MS = parseInt(process.env.RESULT_TTL_MS || '7000', 10);
+function isControlChannel(channelId) {
+  if (CONTROL_CHANNEL_IDS.length) return CONTROL_CHANNEL_IDS.includes(channelId);
+  if (CONTROL_CHANNEL_ID) return channelId === CONTROL_CHANNEL_ID;
+  return true; // لو ما حددت شي، يشتغل بكل الرومات (مو مستحسن)
+}
+
+const PANEL_TTL_MS  = parseInt(process.env.PANEL_TTL_MS  || '120000', 10); // 2 دقيقة
+const PROMPT_TTL_MS = parseInt(process.env.PROMPT_TTL_MS || '45000', 10);  // 45 ثانية
+const RESULT_TTL_MS = parseInt(process.env.RESULT_TTL_MS || '7000', 10);   // 7 ثواني
 
 const client = new Client({
   intents: [
@@ -112,8 +126,51 @@ function requireUserRole(guild, userId) {
   return { ok: true, role };
 }
 
+// تحويل إيموجي يونيكود → رابط صورة Twemoji PNG
+function unicodeEmojiToTwemojiPng(emoji) {
+  const cps = [];
+  for (const ch of [...emoji.trim()]) cps.push(ch.codePointAt(0).toString(16));
+  const code = cps.join('-');
+  return `https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/${code}.png`;
+}
+
+// يحاول فهم الإدخال: مرفق/رابط/إيموجي مخصص/إيموجي عادي
+function extractIconSource(message, rawText) {
+  // 1) Attachment (صورة مرفقة)
+  if (message?.attachments?.size) {
+    const a = message.attachments.first();
+    return { ok: true, url: a.url };
+  }
+
+  const text = (rawText || '').trim();
+  if (!text) return { ok: false, reason: 'empty' };
+
+  // 2) رابط مباشر
+  if (/^https?:\/\//i.test(text)) {
+    return { ok: true, url: text };
+  }
+
+  // 3) إيموجي مخصص <:name:id> أو <a:name:id>
+  const m = text.match(/<a?:\w+:(\d+)>/);
+  if (m) {
+    const id = m[1];
+    const animated = text.startsWith('<a:');
+    const ext = animated ? 'gif' : 'png';
+    return { ok: true, url: `https://cdn.discordapp.com/emojis/${id}.${ext}?size=96&quality=lossless` };
+  }
+
+  // 4) إيموجي عادي (Unicode)
+  // نعتبر أول رمز فقط (عشان لو كتب كلام كثير)
+  const first = [...text][0];
+  if (first) {
+    return { ok: true, url: unicodeEmojiToTwemojiPng(first) };
+  }
+
+  return { ok: false, reason: 'unknown' };
+}
+
 // ================== Pending (الكتابة في الشات) ==================
-// key: guildId:userId => { action, channelId, roleId, promptMsgId, expiresAt }
+// key: guildId:userId => { action, channelId, roleId, expiresAt }
 const pending = new Map();
 
 function setPending(guildId, userId, payload) {
@@ -169,35 +226,31 @@ client.once('ready', () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
 });
 
-// ================== /رولي ==================
+// ================== Slash Command /رولي (اختياري) ==================
+// ملاحظة: ما نطلب Manage Roles من المستخدم — فقط البوت لازم يكون عنده.
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== COMMAND_NAME) return;
 
-  if (CONTROL_CHANNEL_ID && interaction.channelId !== CONTROL_CHANNEL_ID) {
+  if (!isControlChannel(interaction.channelId)) {
     return interaction.reply({ content: '❌ استخدم الأمر في روم الكنترول فقط.', ephemeral: true });
   }
 
-  // نكتفي برسالة مؤقتة (Ephemeral) هنا، لأنها ما تهم
-  if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageRoles)) {
-    return interaction.reply({ content: '❌ تحتاج صلاحية Manage Roles.', ephemeral: true });
-  }
   const me = interaction.guild.members.me;
   if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-    return interaction.reply({ content: '❌ البوت يحتاج Manage Roles.', ephemeral: true });
+    return interaction.reply({ content: '❌ البوت يحتاج صلاحية Manage Roles.', ephemeral: true });
   }
 
   await interaction.reply({ content: '✅ تم إرسال اللوحة في روم الكنترول.', ephemeral: true });
   await sendPanel(interaction.channel);
 });
 
-// ================== أزرار اللوحة (بدون Ephemeral نهائياً) ==================
+// ================== أزرار اللوحة ==================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
   if (!interaction.guild || !interaction.channel) return;
 
-  if (CONTROL_CHANNEL_ID && interaction.channelId !== CONTROL_CHANNEL_ID) {
-    // ما نرسل Ephemeral حتى هنا — نسوي deferUpdate وخلاص
+  if (!isControlChannel(interaction.channelId)) {
     await interaction.deferUpdate().catch(() => {});
     return;
   }
@@ -205,15 +258,10 @@ client.on('interactionCreate', async (interaction) => {
   const { guild, user, channel } = interaction;
   const delOk = canBotDeleteMessages(channel);
 
-  // مهم: هذا يمنع رسائل "Only you can see this"
+  // يمنع رسائل "Only you can see this"
   await interaction.deferUpdate().catch(() => {});
 
-  // صلاحيات
-  if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageRoles)) {
-    const m = await say(channel, `❌ ${user} تحتاج صلاحية Manage Roles.`);
-    if (delOk) deleteLater(m, RESULT_TTL_MS);
-    return;
-  }
+  // تأكد البوت عنده Manage Roles فقط
   const me = guild.members.me;
   if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
     const m = await say(channel, `❌ ما عندي صلاحية Manage Roles.`);
@@ -289,8 +337,10 @@ client.on('interactionCreate', async (interaction) => {
 
     setRoleId(guild.id, user.id, newRole.id);
 
+    // لازم رول البوت يكون فوق الرول عشان يقدر يعدله لاحقاً
     if (!botAboveRole(guild, newRole)) {
       const m = await say(channel, `✅ ${user} تم إنشاء رول: <@&${newRole.id}> (ارفع رول البوت فوقه للتعديل)`);
+
       if (delOk) deleteLater(m, RESULT_TTL_MS);
       return;
     }
@@ -303,7 +353,7 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  // باقي الأزرار تحتاج رول
+  // باقي الأزرار تحتاج رول (وتعديل رول الشخص نفسه فقط)
   const check = requireUserRole(guild, user.id);
   if (!check.ok) {
     const m = await say(channel, check.msg);
@@ -327,7 +377,6 @@ client.on('interactionCreate', async (interaction) => {
       action: 'rename',
       channelId: channel.id,
       roleId: role.id,
-      promptMsgId: promptMsg?.id || null,
       expiresAt: Date.now() + 30_000
     });
     return;
@@ -342,7 +391,6 @@ client.on('interactionCreate', async (interaction) => {
       action: 'color',
       channelId: channel.id,
       roleId: role.id,
-      promptMsgId: promptMsg?.id || null,
       expiresAt: Date.now() + 30_000
     });
     return;
@@ -350,20 +398,20 @@ client.on('interactionCreate', async (interaction) => {
 
   // تغيير الصورة
   if (interaction.customId === 'btn_icon') {
-    const promptMsg = await say(channel, `🖼️ ${user} ارسل إيموجي 😀🔥 أو رابط صورة مباشر خلال 45 ثانية (أو cancel).`);
+    const promptMsg = await say(channel, `🖼️ ${user} ارسل **إيموجي** أو **صورة** أو **رابط صورة** خلال 45 ثانية (أو cancel).`);
     if (delOk) deleteLater(promptMsg, PROMPT_TTL_MS);
 
     setPending(guild.id, user.id, {
       action: 'icon',
       channelId: channel.id,
       roleId: role.id,
-      promptMsgId: promptMsg?.id || null,
       expiresAt: Date.now() + 45_000
     });
     return;
   }
 
-  // إضافة/إزالة لشخص
+  // إضافة/إزالة لشخص (يعطي/يشيل رول "المستخدم" لشخص آخر)
+  // ملاحظة: هذا ما يعطي صلاحيات تعديل أي رول ثاني — فقط روله هو.
   if (interaction.customId === 'btn_toggle') {
     const promptMsg = await say(channel, `👤 ${user} اكتب منشن/ID للشخص خلال 30 ثانية (أو cancel).`);
     if (delOk) deleteLater(promptMsg, PROMPT_TTL_MS);
@@ -372,7 +420,6 @@ client.on('interactionCreate', async (interaction) => {
       action: 'toggle',
       channelId: channel.id,
       roleId: role.id,
-      promptMsgId: promptMsg?.id || null,
       expiresAt: Date.now() + 30_000
     });
     return;
@@ -384,18 +431,13 @@ client.on('messageCreate', async (message) => {
   try {
     if (!message.guild || message.author.bot) return;
 
-    if (CONTROL_CHANNEL_ID && message.channel.id !== CONTROL_CHANNEL_ID) return;
+    if (!isControlChannel(message.channel.id)) return;
 
     const delOk = canBotDeleteMessages(message.channel);
     const txt = (message.content || '').trim();
 
-    // فتح اللوحة بكلمة "رولي"
+    // فتح اللوحة بكلمة "رولي" — بدون أي صلاحية للأعضاء
     if (txt === 'رولي') {
-      if (!message.member.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-        const m = await say(message.channel, `❌ ${message.author} تحتاج Manage Roles.`);
-        if (delOk) deleteLater(m, RESULT_TTL_MS);
-        return;
-      }
       const me = message.guild.members.me;
       if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
         const m = await say(message.channel, `❌ ما عندي Manage Roles.`);
@@ -483,16 +525,22 @@ client.on('messageCreate', async (message) => {
     }
 
     if (state.action === 'icon') {
-      try {
-        await role.setIcon(content);
-        clearPending(guild.id, message.author.id);
+      const icon = extractIconSource(message, content);
+      clearPending(guild.id, message.author.id);
 
-        const m = await say(message.channel, `🖼️ تم تغيير أيقونة الرول إلى: ${content}`);
+      if (!icon.ok) {
+        const m = await say(message.channel, `❌ أرسل إيموجي أو صورة أو رابط صورة.`);
+        if (delOk) deleteLater(m, RESULT_TTL_MS);
+        return;
+      }
+
+      try {
+        await role.setIcon(icon.url);
+        const m = await say(message.channel, `🖼️ تم تغيير أيقونة الرول.`);
         if (delOk) deleteLater(m, RESULT_TTL_MS);
         return;
       } catch {
-        clearPending(guild.id, message.author.id);
-        const m = await say(message.channel, `❌ ما قدرت أغير الأيقونة. جرّب إيموجي 😀 أو رابط PNG/JPG مباشر (قد يتطلب Boost).`);
+        const m = await say(message.channel, `❌ ما قدرت أغير الأيقونة. (تأكد السيرفر Boost 2 + البوت عنده Manage Roles + Attach Files ليس مطلوب هنا)`);
         if (delOk) deleteLater(m, RESULT_TTL_MS);
         return;
       }
@@ -503,6 +551,7 @@ client.on('messageCreate', async (message) => {
       const targetId = mentioned?.id || parseUserId(content);
 
       if (!targetId) {
+        clearPending(guild.id, message.author.id);
         const m = await say(message.channel, `❌ اكتب منشن صحيح أو ID صحيح.`);
         if (delOk) deleteLater(m, RESULT_TTL_MS);
         return;
@@ -520,20 +569,60 @@ client.on('messageCreate', async (message) => {
       const has = target.roles.cache.has(role.id);
       if (!has) {
         await target.roles.add(role.id).catch(() => {});
-        const m = await say(message.channel, `✅ تم إعطاء الرول لـ ${target}`);
+        const m = await say(message.channel, `✅ تم إعطاء رولك لـ ${target}`);
         if (delOk) deleteLater(m, RESULT_TTL_MS);
         return;
       } else {
         await target.roles.remove(role.id).catch(() => {});
-        const m = await say(message.channel, `❌ تم إزالة الرول من ${target}`);
+        const m = await say(message.channel, `❌ تم إزالة رولك من ${target}`);
         if (delOk) deleteLater(m, RESULT_TTL_MS);
         return;
       }
     }
-
-
   } catch {
     // تجاهل
+  }
+});
+
+
+// ==================== Welcome (ترحيب) ====================
+// حط ملف welcome.png داخل نفس مجلد index.js وارفعه للـ GitHub
+// وحط متغير بيئة: WELCOME_CHANNEL_ID = ايدي روم الترحيب
+client.on('guildMemberAdd', async (member) => {
+  try {
+    const chId = process.env.WELCOME_CHANNEL_ID;
+    if (!chId) return;
+    const channel = member.guild.channels.cache.get(chId);
+    if (!channel || !channel.isTextBased()) return;
+
+    const canvas = createCanvas(735, 245);
+    const ctx = canvas.getContext('2d');
+
+    // Background template
+    const bg = await loadImage(path.join(__dirname, 'welcome.png'));
+    ctx.drawImage(bg, 0, 0, canvas.width, canvas.height);
+
+    // Member avatar (left circle)
+    const avatarURL = member.user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
+    const avatar = await loadImage(avatarURL);
+
+    const cx = 220; // center X
+    const cy = 90;  // center Y
+    const r = 58;   // radius
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.clip();
+    ctx.drawImage(avatar, cx - r, cy - r, r * 2, r * 2);
+    ctx.restore();
+
+    const attachment = new AttachmentBuilder(canvas.toBuffer('image/png'), { name: 'welcome.png' });
+
+    await channel.send({ content: `ارحب ${member} ✨`, files: [attachment] });
+  } catch (e) {
+    console.log('Welcome error:', e);
   }
 });
 
