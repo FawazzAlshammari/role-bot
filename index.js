@@ -137,7 +137,6 @@ function buildPanelEmbed() {
     .setColor(0x6d28d9);
 }
 
-
 function buildPanelRows() {
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('btn_create').setLabel('إنشاء رول').setStyle(ButtonStyle.Success),
@@ -531,6 +530,7 @@ client.on('messageCreate', async (message) => {
         return;
       }
     }
+
 
   } catch {
     // تجاهل
